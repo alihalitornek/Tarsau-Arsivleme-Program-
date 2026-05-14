@@ -7,8 +7,6 @@ static int is_text_file(const char *path) {
 
     int c;
     while ((c = fgetc(f)) != EOF) {
-        /* ASCII metin: 0-127 arası, kontrol karakterleri hariç
-         * (tab, newline, carriage return izinli) */
         if (c > 127) { fclose(f); return 0; }
         if (c < 32 && c != '\t' && c != '\n' && c != '\r') {
             fclose(f); return 0;
@@ -32,21 +30,24 @@ int build_archive(int file_count, char *files[], const char *archive_name) {
         return 1;
     }
 
-    /* Dosyaları doğrula */
     long long total = 0;
+    long long header_size = 10; // İlk 10 bayt boyut bilgisinin kendisi için ayrılır
+    struct stat stats[MAX_FILES];
+    char base_names[MAX_FILES][NAME_FIELD_SIZE];
+
+    /* Dosyaları doğrula ve başlık boyutunu hesapla */
     for (int i = 0; i < file_count; i++) {
         if (!is_text_file(files[i])) {
             fprintf(stderr, "%s giriş dosyasının formatı uyumsuzdur!\n", files[i]);
             return 1;
         }
 
-        struct stat st;
-        if (stat(files[i], &st) != 0) {
+        if (stat(files[i], &stats[i]) != 0) {
             fprintf(stderr, "Hata: %s dosyası okunamadı.\n", files[i]);
             return 1;
         }
         
-        total += (long long)st.st_size;
+        total += (long long)stats[i].st_size;
         if (total > MAX_TOTAL_BYTES) {
             fprintf(stderr, "Hata: giriş dosyalarının toplam boyutu 200 MB'ı geçemez.\n");
             return 1;
@@ -59,7 +60,16 @@ int build_archive(int file_count, char *files[], const char *archive_name) {
                     base, NAME_FIELD_SIZE - 1);
             return 1;
         }
+        
+        strncpy(base_names[i], base, NAME_FIELD_SIZE - 1);
+        base_names[i][NAME_FIELD_SIZE - 1] = '\0';
+
+        /* İstenen format: |Dosya adı, izinler, boyut */
+        char temp[256];
+        int len = snprintf(temp, sizeof(temp), "|%s,%o,%lld", base_names[i], stats[i].st_mode & 07777, (long long)stats[i].st_size);
+        header_size += len;
     }
+    header_size += 1; // En son kapatma '|' işareti için +1
 
     /* Arşivi yaz */
     FILE *out = fopen(archive_name, "wb");
@@ -68,30 +78,17 @@ int build_archive(int file_count, char *files[], const char *archive_name) {
         return 1;
     }
 
-    /* Başlık: dosya sayısı */
-    fprintf(out, "%*d", COUNT_FIELD_SIZE, file_count);
+    /* 1. Bölüm: Başlık uzunluğu (İlk 10 bayt, ASCII formatında sayısal boyut) */
+    fprintf(out, "%010lld", header_size);
 
+    /* Organizasyon (İçerik) bölümü kayıtları */
     for (int i = 0; i < file_count; i++) {
-        const char *base = strrchr(files[i], '/');
-        base = base ? base + 1 : files[i];
+        fprintf(out, "|%s,%o,%lld", base_names[i], stats[i].st_mode & 07777, (long long)stats[i].st_size);
+    }
+    fprintf(out, "|"); // Son kaydın bittiğini belirten kapatma ayırıcısı
 
-        struct stat st;
-        stat(files[i], &st);
-        long long sz = (long long)st.st_size;
-
-        /* Dosya adı alanı */
-        char name_buf[NAME_FIELD_SIZE];
-        memset(name_buf, 0, NAME_FIELD_SIZE);
-        strncpy(name_buf, base, NAME_FIELD_SIZE - 1);
-        fwrite(name_buf, 1, NAME_FIELD_SIZE, out);
-
-        /* Boyut alanı: SIZE_FIELD_SIZE bayt ASCII */
-        fprintf(out, "%*lld", SIZE_FIELD_SIZE, sz);
-        
-        /* İzin alanı (Mode): 8 bayt octal format */
-        fprintf(out, "%0*o", MODE_FIELD_SIZE, st.st_mode & 07777);
-
-        /* Dosya içeriği */
+    /* 2. Bölüm: Arşivlenmiş dosyalar (Son kaydın hemen ardından başlar) */
+    for (int i = 0; i < file_count; i++) {
         FILE *in = fopen(files[i], "rb");
         if (!in) {
             perror(files[i]);
